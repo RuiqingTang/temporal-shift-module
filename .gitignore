@@ -1,0 +1,11 @@
+*.tar
+*.params
+*.onnx
+*.spec
+*.exe
+*.pyc
+
+online_demo/build/*
+online_demo/dist/*
+
+third_parties/*

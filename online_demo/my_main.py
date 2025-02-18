@@ -1,6 +1,23 @@
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+'''
+@File    :   my_main.py
+@Time    :   2025/02/05 14:32:10
+@Author  :   Ruiqing Tang 
+@Contact :   tangruiqing123@gmail.com
+'''
+
 import numpy as np
 import cv2
 import os
+
+# os.environ["TVM_HOME"] = "D:/Projects/Python_projects/pose_estimation/temporal-shift-module/third_parties/tvm/python/tvm"
+# os.environ["TVM_CXX_COMPILER"] = "D:/Software/Anaconda/envs/tsm/Library/bin/clang++.exe"
+# os.environ["TVM_CXX_COMPILER"] = "D:/Software/VS/IDE/VC/Tools/MSVC/14.39.33519/bin/Hostx64/x64/cl.exe"
+# os.environ["TVM_WIN_CC"] = "D:/Software/VS/IDE/VC/Tools/MSVC/14.39.33519/bin/Hostx64/x64/cl.exe"
+
+print("TVM_WIN_CC:", os.getenv("TVM_WIN_CC"))
+# print("TVM_CXX_COMPILER:", os.getenv("TVM_CXX_COMPILER"))
 from typing import Tuple
 import io
 import tvm
@@ -35,13 +52,17 @@ def torch2tvm_module(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Te
         from onnxsim import simplify
         onnx_model, success = simplify(onnx_model)  # this simplifier removes conversion bugs.
         assert success
+
         relay_module, params = tvm.relay.frontend.from_onnx(onnx_model, shape=input_shapes)
+
+        
     with tvm.relay.build_config(opt_level=3):
         graph, tvm_module, params = tvm.relay.build(relay_module, target, params=params)
+        
     return graph, tvm_module, params
 
-
 def torch2executor(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Tensor, ...], target):
+    print("开始转换")
     prefix = f"mobilenet_tsm_tvm_{target}"
     lib_fname = f'{prefix}.tar'
     graph_fname = f'{prefix}.json'
@@ -49,18 +70,21 @@ def torch2executor(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Tens
     if os.path.exists(lib_fname) and os.path.exists(graph_fname) and os.path.exists(params_fname):
         with open(graph_fname, 'rt') as f:
             graph = f.read()
-        tvm_module = tvm.module.load(lib_fname)
-        params = tvm.relay.load_param_dict(bytearray(open(params_fname, 'rb').read()))
+        tvm_module = tvm.runtime.load_module(lib_fname)
+        params = tvm.runtime.load_param_dict(bytearray(open(params_fname, 'rb').read()))
     else:
         graph, tvm_module, params = torch2tvm_module(torch_module, torch_inputs, target)
+
         tvm_module.export_library(lib_fname)
         with open(graph_fname, 'wt') as f:
             f.write(graph)
         with open(params_fname, 'wb') as f:
-            f.write(tvm.relay.save_param_dict(params))
+            f.write(tvm.runtime.save_param_dict(params))
 
-    ctx = tvm.gpu() if target.startswith('cuda') else tvm.cpu()
-    graph_module = graph_runtime.create(graph, tvm_module, ctx)
+    print(1)
+    device = tvm.mps() if target == 'mps' else tvm.cpu()  # 修改为device
+    graph_module = tvm.contrib.graph_executor.create(graph, tvm_module, device)  # 使用device
+
     for pname, pvalue in params.items():
         graph_module.set_input(pname, pvalue)
 
@@ -70,17 +94,18 @@ def torch2executor(torch_module: torch.nn.Module, torch_inputs: Tuple[torch.Tens
         graph_module.run()
         return tuple(graph_module.get_output(index) for index in range(len(inputs)))
 
-    return executor, ctx
+    return executor, device  # 返回device
 
-
-def get_executor(use_gpu=True):
+def get_executor(use_gpu=False):
     torch_module = MobileNetV2(n_class=27)
     if not os.path.exists("mobilenetv2_jester_online.pth.tar"):  # checkpoint not downloaded
         print('Downloading PyTorch checkpoint...')
         import urllib.request
         url = 'https://hanlab18.mit.edu/projects/tsm/models/mobilenetv2_jester_online.pth.tar'
         urllib.request.urlretrieve(url, './mobilenetv2_jester_online.pth.tar')
-    torch_module.load_state_dict(torch.load("mobilenetv2_jester_online.pth.tar"))
+    print("加载模型")
+    torch_module.load_state_dict(torch.load("mobilenetv2_jester_online.pth.tar", weights_only=True))  # 添加weights_only参数
+    print("加载完成")
     torch_inputs = (torch.rand(1, 3, 224, 224),
                     torch.zeros([1, 3, 56, 56]),
                     torch.zeros([1, 4, 28, 28]),
@@ -92,12 +117,12 @@ def get_executor(use_gpu=True):
                     torch.zeros([1, 12, 14, 14]),
                     torch.zeros([1, 20, 7, 7]),
                     torch.zeros([1, 20, 7, 7]))
-    if use_gpu:
-        target = 'cuda'
+    if use_gpu and torch.backends.mps.is_available():  # 使用MPS而不是Metal
+        target = 'mps'
     else:
-        target = 'llvm -mcpu=cortex-a72 -target=armv7l-linux-gnueabihf'
+        target = 'llvm'  # 使用CPU作为后备
+    print(target)
     return torch2executor(torch_module, torch_inputs, target)
-
 
 def transform(frame: np.ndarray):
     # 480, 640, 3, 0 ~ 255
@@ -106,7 +131,6 @@ def transform(frame: np.ndarray):
     frame = np.transpose(frame, axes=[2, 0, 1])  # (3, 224, 224) 0 ~ 1.0
     frame = np.expand_dims(frame, axis=0)  # (1, 3, 480, 640) 0 ~ 1.0
     return frame
-
 
 class GroupScale(object):
     """ Rescales the input PIL.Image to the given 'size'.
@@ -123,14 +147,12 @@ class GroupScale(object):
     def __call__(self, img_group):
         return [self.worker(img) for img in img_group]
 
-
 class GroupCenterCrop(object):
     def __init__(self, size):
         self.worker = torchvision.transforms.CenterCrop(size)
 
     def __call__(self, img_group):
         return [self.worker(img) for img in img_group]
-
 
 class Stack(object):
 
@@ -145,7 +167,6 @@ class Stack(object):
                 return np.concatenate([np.array(x)[:, :, ::-1] for x in img_group], axis=2)
             else:
                 return np.concatenate(img_group, axis=2)
-
 
 class ToTorchFormatTensor(object):
     """ Converts a PIL.Image (RGB) or numpy.ndarray (H x W x C) in the range [0, 255]
@@ -167,7 +188,6 @@ class ToTorchFormatTensor(object):
             img = img.transpose(0, 1).transpose(0, 2).contiguous()
         return img.float().div(255) if self.div else img.float()
 
-
 class GroupNormalize(object):
     def __init__(self, mean, std):
         self.mean = mean
@@ -182,7 +202,6 @@ class GroupNormalize(object):
             t.sub_(m).div_(s)
 
         return tensor
-
 
 def get_transform():
     cropping = torchvision.transforms.Compose([
@@ -227,9 +246,9 @@ catigories = [
     "Zooming Out With Two Fingers"  # 26
 ]
 
-
 n_still_frame = 0
 
+'''
 def process_output(idx_, history):
     # idx_: the output of current frame
     # history: a list containing the history of predictions
@@ -256,7 +275,32 @@ def process_output(idx_, history):
     history = history[-max_hist_len:]
 
     return history[-1], history
+'''
+def process_output(idx_, history):
+    # idx_: the output of current frame
+    # history: a list containing the history of predictions
+    if not REFINE_OUTPUT:
+        return idx_, history
 
+    max_hist_len = 20  # max history buffer
+
+    # mask out illegal action
+    if idx_ in [7, 8, 21, 22, 3]:
+        idx_ = history[-1]
+
+    # use only single no action class
+    if idx_ == 0:
+        idx_ = 2
+    
+    # history smoothing
+    if len(history) > 1 and idx_ != history[-1]:  # 添加长度检查
+        if not (history[-1] == history[-2]): #  and history[-2] == history[-3]):
+            idx_ = history[-1]
+    
+    history.append(idx_)
+    history = history[-max_hist_len:]
+
+    return history[-1], history
 
 WINDOW_NAME = 'Video Gesture Recognition'
 def main():
@@ -276,24 +320,36 @@ def main():
     cv2.moveWindow(WINDOW_NAME, 0, 0)
     cv2.setWindowTitle(WINDOW_NAME, WINDOW_NAME)
 
-
     t = None
     index = 0
     print("Build transformer...")
     transform = get_transform()
     print("Build Executor...")
-    executor, ctx = get_executor()
+    # executor, ctx = get_executor()
+    # buffer = (
+    #     tvm.nd.empty((1, 3, 56, 56), ctx=ctx),
+    #     tvm.nd.empty((1, 4, 28, 28), ctx=ctx),
+    #     tvm.nd.empty((1, 4, 28, 28), ctx=ctx),
+    #     tvm.nd.empty((1, 8, 14, 14), ctx=ctx),
+    #     tvm.nd.empty((1, 8, 14, 14), ctx=ctx),
+    #     tvm.nd.empty((1, 8, 14, 14), ctx=ctx),
+    #     tvm.nd.empty((1, 12, 14, 14), ctx=ctx),
+    #     tvm.nd.empty((1, 12, 14, 14), ctx=ctx),
+    #     tvm.nd.empty((1, 20, 7, 7), ctx=ctx),
+    #     tvm.nd.empty((1, 20, 7, 7), ctx=ctx)
+    # )
+    executor, device = get_executor()  # 修改为device
     buffer = (
-        tvm.nd.empty((1, 3, 56, 56), ctx=ctx),
-        tvm.nd.empty((1, 4, 28, 28), ctx=ctx),
-        tvm.nd.empty((1, 4, 28, 28), ctx=ctx),
-        tvm.nd.empty((1, 8, 14, 14), ctx=ctx),
-        tvm.nd.empty((1, 8, 14, 14), ctx=ctx),
-        tvm.nd.empty((1, 8, 14, 14), ctx=ctx),
-        tvm.nd.empty((1, 12, 14, 14), ctx=ctx),
-        tvm.nd.empty((1, 12, 14, 14), ctx=ctx),
-        tvm.nd.empty((1, 20, 7, 7), ctx=ctx),
-        tvm.nd.empty((1, 20, 7, 7), ctx=ctx)
+        tvm.nd.empty((1, 3, 56, 56), device=device),  # 修改为device
+        tvm.nd.empty((1, 4, 28, 28), device=device),
+        tvm.nd.empty((1, 4, 28, 28), device=device),
+        tvm.nd.empty((1, 8, 14, 14), device=device),
+        tvm.nd.empty((1, 8, 14, 14), device=device),
+        tvm.nd.empty((1, 8, 14, 14), device=device),
+        tvm.nd.empty((1, 12, 14, 14), device=device),
+        tvm.nd.empty((1, 12, 14, 14), device=device),
+        tvm.nd.empty((1, 20, 7, 7), device=device),
+        tvm.nd.empty((1, 20, 7, 7), device=device)
     )
     idx = 0
     history = [2]
@@ -310,7 +366,7 @@ def main():
             t1 = time.time()
             img_tran = transform([Image.fromarray(img).convert('RGB')])
             input_var = torch.autograd.Variable(img_tran.view(1, 3, img_tran.size(1), img_tran.size(2)))
-            img_nd = tvm.nd.array(input_var.detach().numpy(), ctx=ctx)
+            img_nd = tvm.nd.array(input_var.detach().numpy(), device=device)
             inputs: Tuple[tvm.nd.NDArray] = (img_nd,) + buffer
             outputs = executor(inputs)
             feat, buffer = outputs[0], outputs[1:]
@@ -340,7 +396,6 @@ def main():
             t2 = time.time()
             print(f"{index} {catigories[idx]}")
 
-
             current_time = t2 - t1
 
         img = cv2.resize(img, (640, 480))
@@ -356,7 +411,6 @@ def main():
                     (width - 170, int(height / 16)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (0, 0, 0), 2)
-
         img = np.concatenate((img, label), axis=0)
         cv2.imshow(WINDOW_NAME, img)
 
@@ -373,7 +427,6 @@ def main():
             else:
                 cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
                                       cv2.WINDOW_NORMAL)
-
 
         if t is None:
             t = time.time()
